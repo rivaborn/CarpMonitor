@@ -82,7 +82,8 @@ def _parse_env_file(path: str, into: dict) -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            into[k.strip()] = v.strip().strip('"').strip("'")
+            v = v.split(" #", 1)[0].strip().strip('"').strip("'")  # drop inline comment + quotes
+            into[k.strip()] = v
 
 
 def load_config() -> dict:

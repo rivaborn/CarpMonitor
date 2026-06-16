@@ -7,9 +7,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /opt/carp-watchdog/watchdog.py
-# config.env is also parsed by the daemon itself; loading it here too is harmless
-# and makes the tunables visible to `systemctl show`.
-EnvironmentFile=/etc/carp-watchdog/config.env
+# The daemon reads /etc/carp-watchdog/config.env and .env itself (so it works
+# when run by hand too); no EnvironmentFile needed.
 Restart=always
 RestartSec=10
 
