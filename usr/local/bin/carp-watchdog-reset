@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# carp-watchdog-reset — clear the watchdog latch and optionally undo the lever.
+#
+# After the watchdog FIRES (or HELDs) it latches and takes no further action.
+# Run this once the primary is healthy again to: (optionally) un-demote the
+# primary / restart its VM, then clear the latch back to HEALTHY and restart
+# the service.
+set -euo pipefail
+
+# Load tunables (config.env) then private site values (.env). Same precedence
+# as the daemon; .env wins.
+CONFIG=${CARP_WATCHDOG_CONFIG:-/etc/carp-watchdog/config.env}
+ENVFILE=${CARP_WATCHDOG_ENV:-/etc/carp-watchdog/.env}
+# shellcheck disable=SC1090
+[ -r "$CONFIG" ]  && . "$CONFIG"
+# shellcheck disable=SC1090
+[ -r "$ENVFILE" ] && . "$ENVFILE"
+
+STATE_FILE=${STATE_FILE:-/var/lib/carp-watchdog/state.json}
+SSH_KEY=${SSH_KEY:-/etc/carp-watchdog/id_ed25519}
+SSH_KNOWN_HOSTS=${SSH_KNOWN_HOSTS:-/etc/carp-watchdog/known_hosts}
+PRIMARY_PORT=${PRIMARY_PORT:-22}; PRIMARY_USER=${PRIMARY_USER:-root}
+HOST_PORT=${HOST_PORT:-22};       HOST_USER=${HOST_USER:-root}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "run as root (sudo carp-watchdog-reset)" >&2
+    exit 1
+fi
+if [ -z "${PRIMARY:-}" ] || [ -z "${HOST:-}" ]; then
+    echo "PRIMARY/HOST not set — is $ENVFILE present and readable?" >&2
+    exit 1
+fi
+if [ ! -f "$STATE_FILE" ]; then
+    echo "no state file at $STATE_FILE — nothing to reset"
+    exit 0
+fi
+
+ssh_t() {
+    ssh -i "$SSH_KEY" -o UserKnownHostsFile="$SSH_KNOWN_HOSTS" \
+        -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 "$@"
+}
+field() { python3 -c "import json;print(json.load(open('$STATE_FILE')).get('$1',''))" 2>/dev/null || true; }
+
+echo "Current watchdog state:"
+cat "$STATE_FILE"
+echo
+
+LEVER=$(field lever_used)
+DEMO=$(field applied_demotion)
+
+read -rp "Clear the latch and return to HEALTHY? [y/N] " a
+[ "${a,,}" = y ] || { echo "aborted."; exit 1; }
+
+# --- undo a graceful demotion (force the primary's demotion counter back to 0) ---
+if [ -n "${DEMO:-}" ] && [ "${DEMO:-0}" != "0" ]; then
+    echo "A CARP demotion of +$DEMO was applied to the primary ($PRIMARY)."
+    read -rp "Un-demote the primary now (forces net.inet.carp.demotion back to 0)? [y/N] " b
+    if [ "${b,,}" = y ]; then
+        CUR=$(ssh_t -p "$PRIMARY_PORT" "$PRIMARY_USER@$PRIMARY" "sysctl -n net.inet.carp.demotion" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -z "$CUR" ]; then
+            echo "WARN: could not read current demotion from $PRIMARY (SSH down?). Un-demote by hand."
+        elif [ "$CUR" = 0 ]; then
+            echo "primary demotion is already 0 (likely rebooted) — nothing to undo."
+        elif ssh_t -p "$PRIMARY_PORT" "$PRIMARY_USER@$PRIMARY" "sysctl net.inet.carp.demotion=-$CUR"; then
+            echo "un-demoted (was $CUR -> 0)."
+        else
+            echo "WARN: un-demote failed — do it by hand before the primary should reclaim MASTER."
+        fi
+    else
+        echo "skipped — primary stays demoted (backup keeps MASTER)."
+    fi
+fi
+
+# --- if the VM was hard-stopped, offer to start it again -----------------------
+if [ "$LEVER" = qm_stop ]; then
+    echo "Lever used was 'qm stop $VMID' — the primary pfSense VM is OFF."
+    read -rp "Start VM $VMID on host $HOST now (qm start $VMID)? [y/N] " c
+    if [ "${c,,}" = y ]; then
+        if ssh_t -p "$HOST_PORT" "$HOST_USER@$HOST" "qm start $VMID"; then
+            echo "VM started — let it fully boot before it should reclaim MASTER."
+        else
+            echo "WARN: qm start failed — start it by hand."
+        fi
+    fi
+fi
+
+# --- write HEALTHY state atomically, preserving ownership ----------------------
+OWNER=$(stat -c '%U:%G' "$STATE_FILE" 2>/dev/null || echo "root:root")
+TMP=$(mktemp)
+cat > "$TMP" <<'JSON'
+{
+  "applied_demotion": 0,
+  "consecutive_fails": 0,
+  "dry_run": false,
+  "lever_used": null,
+  "reason": "reset by carp-watchdog-reset",
+  "state": "HEALTHY",
+  "suspect_since": null,
+  "updated": null
+}
+JSON
+chown "$OWNER" "$TMP" 2>/dev/null || true
+chmod 644 "$TMP"
+mv "$TMP" "$STATE_FILE"
+echo "latch cleared -> HEALTHY."
+
+if systemctl is-active --quiet carp-watchdog; then
+    systemctl restart carp-watchdog && echo "restarted carp-watchdog service."
+else
+    echo "(service not active; start it with: systemctl start carp-watchdog)"
+fi

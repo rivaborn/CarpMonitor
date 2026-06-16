@@ -1,0 +1,15 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+
+# Local runtime state / test scratch (never belongs in the repo)
+_test_state.json
+state.json
+*.tmp
+
+# Secrets — keys live only on .5 (/etc/carp-watchdog/), never here
+id_ed25519
+id_ed25519.pub
+known_hosts
+.tokens/
+.env
