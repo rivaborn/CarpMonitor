@@ -48,6 +48,7 @@ DEFAULTS = {
     "CONFIRM_FAILS":  "2",      # consecutive fails -> SUSPECT (+ "armed" alert)
     "ARM_SECONDS":    "600",    # continuous-fail seconds in SUSPECT -> fire
     "POST_FIRE_WAIT": "60",     # after a lever, poll egress this long for recovery
+    "REALERT_SECONDS": "21600", # while latched, repeat the ntfy reminder this often (0 = never)
     "CANARIES":       "1.1.1.1,8.8.8.8,9.9.9.9",  # public ICMP targets; healthy if ANY answers
     "DEMOTION":       "240",    # CARP demotion delta applied to the primary
     "NTFY_TOPIC":     "carp-watchdog",
@@ -108,6 +109,7 @@ class Cfg:
         self.confirm_fails = int(d["CONFIRM_FAILS"])
         self.arm_seconds = int(d["ARM_SECONDS"])
         self.post_fire_wait = int(d["POST_FIRE_WAIT"])
+        self.realert_seconds = int(d["REALERT_SECONDS"])
         self.canaries = [c.strip() for c in d["CANARIES"].split(",") if c.strip()]
         self.gateway_vip = d["GATEWAY_VIP"]
         self.primary = (d["PRIMARY"], int(d["PRIMARY_PORT"]), d["PRIMARY_USER"])
@@ -145,6 +147,8 @@ _STATE_DEFAULTS = {
     "reason": "",
     "dry_run": False,
     "updated": None,
+    "latched_since": None,   # when FIRED/HELD was entered (None on pre-reminder state files)
+    "last_reminder": None,   # last latched alert; None -> remind on the next tick
 }
 
 
@@ -277,6 +281,7 @@ def _latch_fired(cfg: Cfg, state: dict, dry_run: bool, lever: str,
                  recovered: bool | None) -> None:
     state["state"] = FIRED
     state["dry_run"] = dry_run
+    state["latched_since"] = state["last_reminder"] = time.time()
     if dry_run:
         rec_txt = "egress recovery not measured (dry-run)"
     elif recovered:
@@ -300,6 +305,7 @@ def _hold(cfg: Cfg, state: dict, reason: str, title: str, message: str,
           tags: str, priority: str = "4") -> None:
     state["state"] = HELD
     state["reason"] = reason
+    state["latched_since"] = state["last_reminder"] = time.time()
     notify(cfg, title, message, tags=tags, priority=priority, click=cfg.wiki_url or None)
     log.error("LATCHED HELD: %s", reason)
 
@@ -382,16 +388,38 @@ def attempt_failover(cfg: Cfg, state: dict, dry_run: bool) -> None:
           tags="rotating_light,sos", priority="5")
 
 
+def remind_latched(cfg: Cfg, state: dict) -> None:
+    """Re-alert every REALERT_SECONDS while latched (0 disables). A missing
+    last_reminder (a latch older than this feature, or a restart) reminds at once."""
+    if cfg.realert_seconds <= 0:
+        return
+    now = time.time()
+    last = state["last_reminder"]
+    if last is not None and now - last < cfg.realert_seconds:
+        return
+    since = state["latched_since"]
+    since_txt = (time.strftime("%Y-%m-%d %H:%M", time.localtime(since))
+                 if since else "an unknown time")
+    notify(cfg, f"CARP watchdog: still {state['state']}",
+           f"Latched in {state['state']} since {since_txt} and taking NO action: "
+           f"{state['reason']}. Run carp-watchdog-reset once the pair is healthy.",
+           tags="warning,repeat", priority="4", click=cfg.wiki_url or None)
+    state["last_reminder"] = now
+    save_state(cfg, state)
+
+
 # --------------------------------------------------------------------------
 # One poll cycle
 # --------------------------------------------------------------------------
 def tick(cfg: Cfg, dry_run: bool) -> dict:
     state = load_state(cfg)
 
-    # Latched: observe only. carp-watchdog-reset clears the latch on disk and we resume.
+    # Latched: no action, but keep reminding — a latch nobody notices disables the
+    # watchdog indefinitely. carp-watchdog-reset clears the latch on disk and we resume.
     if state["state"] in LATCHED:
         log.debug("latched in %s (%s) — no action until carp-watchdog-reset",
                   state["state"], state["reason"])
+        remind_latched(cfg, state)
         return state
 
     ok, gw_pings, reachable = gateway_passes_traffic(cfg)

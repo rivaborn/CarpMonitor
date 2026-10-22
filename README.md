@@ -50,7 +50,9 @@ ladder: **(1)** `sysctl net.inet.carp.demotion=<DEMOTION>` on the primary
 (reversible), then polls egress; **(2)** if that fails, `qm stop <VMID>` on the
 hypervisor host. Either success → `FIRED` + latched. Both unavailable → `HELD`
 CRITICAL. The latch (persisted in `state.json`) prevents flapping until
-`carp-watchdog-reset` runs.
+`carp-watchdog-reset` runs. While latched the watchdog takes no action, so it
+repeats a "still FIRED/HELD" ntfy every `REALERT_SECONDS` (6 h; `0` = never),
+and once at start-up if it starts latched.
 
 ## Deploy
 
@@ -129,3 +131,25 @@ watchdog.py --dry-run    # poll loop; logs intended lever, never executes, still
   reconnect. The "armed" alert therefore may not be seen until *after* failover
   restores the path — i.e. for a real wedge the arm window is effectively
   full-auto by design.
+
+## Companion: `pfsense/wan-carp-demote.sh` (runs on the primary firewall)
+
+The watchdog catches a primary that stops passing traffic. A dead **WAN** on the
+primary is caught sooner by this script, which runs on the primary itself
+(Site A: `/conf/wan-carp-demote/wan-carp-demote.sh` on `.3`, from a pfSense
+`cron/item` every minute). After 3 consecutive minutes of pfSense's own gateway
+status for `WAN_DHCP` reading `down`, it adds `net.inet.carp.demotion=240` so
+the backup takes the VIP; after 5 consecutive minutes of `online` it removes
+exactly the demotion it added. `loss`/`delay` never trigger it. State lives in
+`/var/run/wan-carp-demote.state` and is discarded after a reboot (which resets
+the demotion counter). Alerts go to the same ntfy topic as the watchdog.
+
+```sh
+wan-carp-demote.sh --status            # gateway status, counters, current demotion
+wan-carp-demote.sh --dry-run           # one tick with its own state; changes nothing
+echo down > /tmp/wan-carp-demote.force.dry-run   # simulate an outage for --dry-run
+echo down > /tmp/wan-carp-demote.force           # LIVE test: really fails over in ~3 min
+```
+
+Written after the 2026-10-22 FiOS outage, in which the primary's WAN lost DHCP
+for 17 minutes, CARP kept the VIP on it, and the watchdog was latched `HELD`.
