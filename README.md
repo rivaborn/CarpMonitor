@@ -144,12 +144,23 @@ exactly the demotion it added. `loss`/`delay` never trigger it. State lives in
 `/var/run/wan-carp-demote.state` and is discarded after a reboot (which resets
 the demotion counter). Alerts go to the same ntfy topic as the watchdog.
 
+Before demoting, it checks that the **backup** can reach the internet: it adds a
+temporary host route for `149.112.112.112` via the backup's LAN address
+(`192.168.1.2`), pings it, and removes the route, which tests the path LAN
+clients would take after the failover. If the backup is dead too it holds (one
+ntfy, "held"), and re-checks every minute, so it fails over as soon as the
+backup recovers while the WAN is still down.
+
 ```sh
-wan-carp-demote.sh --status            # gateway status, counters, current demotion
+wan-carp-demote.sh --status            # gateway status, counters, demotion, backup internet
 wan-carp-demote.sh --dry-run           # one tick with its own state; changes nothing
 echo down > /tmp/wan-carp-demote.force.dry-run   # simulate an outage for --dry-run
+WCD_BACKUP_LAN=192.168.1.250 wan-carp-demote.sh --dry-run   # simulate a dead backup
 echo down > /tmp/wan-carp-demote.force           # LIVE test: really fails over in ~3 min
 ```
 
 Written after the 2026-10-22 FiOS outage, in which the primary's WAN lost DHCP
 for 17 minutes, CARP kept the VIP on it, and the watchdog was latched `HELD`.
+The backup check was added after that night's live test, when the T-Mobile
+backup lost its upstream two minutes into carrying the site and stayed down for
+about 18 minutes.
