@@ -1,0 +1,10 @@
+# /conf/wg-s2s/wg-s2s.conf - per-site settings for wg-s2s.sh (one file on each CARP master).
+# The live files hold this lab's values; this example uses placeholders.
+WG_IF=tun_wg0                 # this master's site-to-site WireGuard interface
+LOCAL_TUN=10.255.255.1        # this end of the /30 tunnel net
+PEER_TUN=10.255.255.2         # the other master's end (health-check target)
+PEER_PUB=<peer public key>    # the other master's WireGuard public key
+PEER_TS_IP=100.x.y.z          # the other master's Tailscale address (endpoint re-learn source)
+REMOTE_NETS="192.168.50.0/25 192.168.50.128/25"   # the remote LAN /24 as two /25s (beat Tailscale's /24)
+CARP_IF=vtnet0                # interface carrying the LAN CARP VIP
+CARP_VHID=1                   # its VHID

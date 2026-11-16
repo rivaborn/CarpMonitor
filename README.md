@@ -164,3 +164,70 @@ for 17 minutes, CARP kept the VIP on it, and the watchdog was latched `HELD`.
 The backup check was added after that night's live test, when the T-Mobile
 backup lost its upstream two minutes into carrying the site and stayed down for
 about 18 minutes.
+
+## Companion: `pfsense/wg-s2s/` (site-to-site WireGuard fast path, both masters)
+
+The two sites are joined by a Tailscale subnet route between the pfSense CARP
+masters. On pfSense that is user-space `wireguard-go` on Celeron J3160s, and it
+carried about 1 MB/s per stream (2 MB/s on four). A kernel WireGuard tunnel
+(`pfSense-pkg-WireGuard`, `if_wg`) between the same two masters carries about
+17 MB/s on one stream (measured 2026-11-16, Coachman to Saginaw; the other
+direction is capped by Saginaw's 21 Mbit/s upload either way). Tailscale stays
+as the fallback and for off-site access.
+
+`wg-s2s.sh` runs on each master from a pfSense `cron/item` every minute
+(`lockf`, 5 checks 10 s apart), with its settings in `/conf/wg-s2s/wg-s2s.conf`
+(see `wg-s2s.conf.example`):
+
+- Tailscale installs the remote LAN as a `/24` on `tailscale0`. While the peer's
+  tunnel address answers ping, the script adds the remote LAN as two `/25`s on
+  the WireGuard interface; being more specific, they win.
+- After 2 failed checks it deletes the `/25`s, and traffic is back on Tailscale
+  at once. It then re-learns the peer's public address from
+  `tailscale debug netmap` (both WANs are DHCP), sets it with `wg set`, and
+  writes it to `config.xml`. WireGuard roaming already handles one side
+  changing address; the re-learn covers both changing while the tunnel is down.
+- A node that is not CARP master deletes its `/25`s **and takes its tunnel
+  down**. Otherwise the peer keeps routing to it while replies leave through the
+  new master over Tailscale, and that asymmetric path breaks TCP (states are
+  `if-bound`). With the tunnel down the peer falls back too.
+
+Set-up helpers (run once per master, in order): `wg_stage_a.php` creates the
+tunnel and prints its public key, `wg_stage_b.php` adds the peer and starts the
+service, `wg_rules.php` adds the firewall rules, `wg_cron.php` adds (or
+`remove`s) the cron entry. They go through the package's own form handlers, so
+everything is visible and editable in the GUI. Plain `php` works: the scripts
+clear `$argv` before including the package, whose `wg_service.inc` otherwise
+starts its service entry point (and dies unless run by `php_wg`).
+
+Firewall rules (`wg_rules.php`):
+
+- WAN: pass UDP 51820 from any (peer keys authenticate; "any" survives the
+  peer's DHCP address changing).
+- WireGuard group: pass the remote LAN and the tunnel net.
+- WireGuard group, **in and out (floating)**: block UDP 41641 between the
+  tunnel addresses. `tailscaled` offers every local address as an endpoint and
+  otherwise moves the router-to-router Tailscale path *inside* the WireGuard
+  tunnel, so the fallback would die with the tunnel it backs up. The inbound
+  block alone is not enough: both sides send, so each side's outbound state
+  admits the other's packets.
+
+Rules on the WireGuard group are HA-synced to the backups, which do not have the
+package: pfSense comments them out there (`array key "WireGuard" does not
+exist`), so they are harmless. Only the masters run WireGuard (the backups' WANs
+are double-NAT'd); after a CARP failover, traffic between the sites runs over
+Tailscale until the master returns.
+
+```sh
+grep 'wg-s2s\[' /var/log/system.log        # state changes
+wg show                                      # handshake, endpoint, transfer
+netstat -rn -f inet | grep tun_wg            # the /25s while WireGuard carries traffic
+php /conf/wg-s2s/wg_cron.php remove          # rollback step 1 (then delete the /25s)
+```
+
+Tested 2026-11-16: tunnel down on one side (routes withdrawn on both in about
+20 s, restored about 10 s after it came back), a graceful Saginaw CARP failover
+and failback (no lost pings; WireGuard back about 6 s after the master
+returned), and wrong endpoints on both sides (corrected by roaming before the
+script needed to). Re-check after any pfSense upgrade, like the `rc.carp*`
+hooks.
