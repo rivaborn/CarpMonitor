@@ -212,6 +212,15 @@ Firewall rules (`wg_rules.php`):
   block alone is not enough: both sides send, so each side's outbound state
   admits the other's packets.
 
+Outbound NAT (Coachman master only, hybrid mode, added by hand): the Coachman
+Wi-Fi VLANs are not in Saginaw's AllowedIPs for the peer, so three rules on the
+`WireGuard` group translate `192.168.3.0/24`, `10.1.0.0/24` and `10.2.0.0/24`
+bound for `192.168.50.0/24` to the tunnel address `10.255.255.1`. They mirror
+the existing `nat on Tailscale from any to 192.168.50.0/24` rule, which is how
+those VLANs reached Saginaw before. Missing them cut the Wi-Fi VLANs off from
+Saginaw for about 35 minutes after the first cutover. Before changing the path
+between the sites, check `pfctl -s nat` and test from every VLAN.
+
 Rules on the WireGuard group are HA-synced to the backups, which do not have the
 package: pfSense comments them out there (`array key "WireGuard" does not
 exist`), so they are harmless. Only the masters run WireGuard (the backups' WANs
